@@ -4,9 +4,6 @@
  */
 package org.mockito.internal.creation.bytebuddy;
 
-import static org.mockito.internal.creation.bytebuddy.InlineBytecodeGenerator.EXCLUDES;
-import static org.mockito.internal.util.StringUtil.join;
-
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -20,8 +17,6 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
 
-import javax.tools.ToolProvider;
-
 import net.bytebuddy.agent.ByteBuddyAgent;
 import org.mockito.Incubating;
 import org.mockito.creation.instance.Instantiator;
@@ -34,6 +29,9 @@ import org.mockito.internal.util.concurrent.WeakConcurrentMap;
 import org.mockito.invocation.MockHandler;
 import org.mockito.mock.MockCreationSettings;
 import org.mockito.plugins.InlineMockMaker;
+
+import static org.mockito.internal.creation.bytebuddy.InlineBytecodeGenerator.*;
+import static org.mockito.internal.util.StringUtil.*;
 
 /**
  * Agent and subclass based mock maker.
@@ -191,12 +189,34 @@ public class InlineByteBuddyMockMaker implements ClassCreatingMockMaker, InlineM
 
     public InlineByteBuddyMockMaker() {
         if (INITIALIZATION_ERROR != null) {
+            String detail;
+            if (System.getProperty("java.specification.vendor", "")
+                    .toLowerCase()
+                    .contains("android")) {
+                detail =
+                        "It appears as if you are trying to run this mock maker on Android which does not support the instrumentation API.";
+            } else {
+                try {
+                    if (Class.forName("javax.tools.ToolProvider")
+                                    .getMethod("getSystemJavaCompiler")
+                                    .invoke(null)
+                            == null) {
+                        detail =
+                                "It appears as if you are running on a JRE. Either install a JDK or add JNA to the class path.";
+                    } else {
+                        detail =
+                                "It appears as if your JDK does not supply a working agent attachment mechanism.";
+                    }
+                } catch (Throwable ignored) {
+                    detail =
+                            "It appears as if you are running an incomplete JVM installation that might not support all tooling APIs";
+                }
+            }
             throw new MockitoInitializationException(
                     join(
-                            "Could not initialize inline Byte Buddy mock maker. (This mock maker is not supported on Android.)",
-                            ToolProvider.getSystemJavaCompiler() == null
-                                    ? "Are you running a JRE instead of a JDK? The inline mock maker needs to be run on a JDK.\n"
-                                    : "",
+                            "Could not initialize inline Byte Buddy mock maker.",
+                            "",
+                            detail,
                             Platform.describe()),
                     INITIALIZATION_ERROR);
         }
