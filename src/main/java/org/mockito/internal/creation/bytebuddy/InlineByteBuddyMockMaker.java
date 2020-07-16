@@ -4,9 +4,6 @@
  */
 package org.mockito.internal.creation.bytebuddy;
 
-import static org.mockito.internal.creation.bytebuddy.InlineBytecodeGenerator.EXCLUDES;
-import static org.mockito.internal.util.StringUtil.join;
-
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -14,9 +11,15 @@ import java.io.InputStream;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.IntFunction;
+import java.util.function.Predicate;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
@@ -25,6 +28,7 @@ import javax.tools.ToolProvider;
 
 import net.bytebuddy.agent.ByteBuddyAgent;
 import org.mockito.Incubating;
+import org.mockito.MockedConstruction;
 import org.mockito.creation.instance.InstantiationException;
 import org.mockito.creation.instance.Instantiator;
 import org.mockito.exceptions.base.MockitoException;
@@ -36,6 +40,9 @@ import org.mockito.internal.util.concurrent.WeakConcurrentMap;
 import org.mockito.invocation.MockHandler;
 import org.mockito.mock.MockCreationSettings;
 import org.mockito.plugins.InlineMockMaker;
+
+import static org.mockito.internal.creation.bytebuddy.InlineBytecodeGenerator.*;
+import static org.mockito.internal.util.StringUtil.*;
 
 /**
  * Agent and subclass based mock maker.
@@ -192,6 +199,9 @@ public class InlineByteBuddyMockMaker
     private final DetachedThreadLocal<Map<Class<?>, MockMethodInterceptor>> mockedStatics =
             new DetachedThreadLocal<>(DetachedThreadLocal.Cleaner.INLINE);
 
+    private final DetachedThreadLocal<Map<Class<?>, Consumer<Object>>> mockedConstruction =
+            new DetachedThreadLocal<>(DetachedThreadLocal.Cleaner.INLINE);
+
     private final ThreadLocal<Boolean> mockConstruction = ThreadLocal.withInitial(() -> false);
 
     public InlineByteBuddyMockMaker() {
@@ -205,10 +215,37 @@ public class InlineByteBuddyMockMaker
                             Platform.describe()),
                     INITIALIZATION_ERROR);
         }
+
+        Predicate<Class<?>> isMockConstruction =
+                type -> {
+                    if (mockConstruction.get()) {
+                        return true;
+                    }
+                    Map<Class<?>, ?> interceptors = mockedConstruction.get();
+                    return interceptors != null && interceptors.containsKey(type);
+                };
+        BiConsumer<Class<?>, Object> onConstruction =
+                (type, object) -> {
+                    if (mockConstruction.get()) {
+                        return;
+                    }
+                    Map<Class<?>, Consumer<Object>> interceptors = mockedConstruction.get();
+                    if (interceptors != null) {
+                        Consumer<Object> interceptor = interceptors.get(type);
+                        if (interceptor != null) {
+                            interceptor.accept(object);
+                        }
+                    }
+                };
+
         bytecodeGenerator =
                 new TypeCachingBytecodeGenerator(
                         new InlineBytecodeGenerator(
-                                INSTRUMENTATION, mocks, mockedStatics, mockConstruction::get),
+                                INSTRUMENTATION,
+                                mocks,
+                                mockedStatics,
+                                isMockConstruction,
+                                onConstruction),
                         true);
     }
 
@@ -417,6 +454,34 @@ public class InlineByteBuddyMockMaker
     }
 
     @Override
+    public <T> ConstructionMockControl<T> createConstructionMock(
+            Class<T> type,
+            IntFunction<MockCreationSettings<T>> settings,
+            IntFunction<MockHandler<T>> handler,
+            MockedConstruction.Preparation<T> preparation) {
+        if (type == Object.class) {
+            throw new MockitoException(
+                    "It is not possible to mock construction of the Object class "
+                            + "to avoid inference with default object constructor chains");
+        } else if (type.isPrimitive() || Modifier.isAbstract(type.getModifiers())) {
+            throw new MockitoException(
+                    "It is not possible to construct primitive types or abstract types: "
+                            + type.getTypeName());
+        }
+
+        bytecodeGenerator.mockClassConstruction(type);
+
+        Map<Class<?>, Consumer<Object>> interceptors = mockedConstruction.get();
+        if (interceptors == null) {
+            interceptors = new WeakHashMap<>();
+            mockedConstruction.set(interceptors);
+        }
+
+        return new InlineConstructionMockControl<>(
+                type, settings, handler, preparation, interceptors);
+    }
+
+    @Override
     @SuppressWarnings("unchecked")
     public <T> T newInstance(Class<T> cls) throws InstantiationException {
         Constructor<?>[] constructors = cls.getDeclaredConstructors();
@@ -481,6 +546,7 @@ public class InlineByteBuddyMockMaker
         private final Map<Class<?>, MockMethodInterceptor> interceptors;
 
         private final MockCreationSettings<T> settings;
+
         private final MockHandler handler;
 
         private InlineStaticMockControl(
@@ -526,6 +592,93 @@ public class InlineByteBuddyMockMaker
                                         + type.getSimpleName()
                                         + ".class)"));
             }
+        }
+    }
+
+    private class InlineConstructionMockControl<T> implements ConstructionMockControl<T> {
+
+        private final Class<T> type;
+
+        private final IntFunction<MockCreationSettings<T>> settings;
+        private final IntFunction<MockHandler<T>> handler;
+
+        private final MockedConstruction.Preparation<T> preparation;
+
+        private final Map<Class<?>, Consumer<Object>> interceptors;
+
+        private final List<Object> all = new ArrayList<>();
+        private int count;
+
+        private InlineConstructionMockControl(
+                Class<T> type,
+                IntFunction<MockCreationSettings<T>> settings,
+                IntFunction<MockHandler<T>> handler,
+                MockedConstruction.Preparation<T> preparation,
+                Map<Class<?>, Consumer<Object>> interceptors) {
+            this.type = type;
+            this.settings = settings;
+            this.handler = handler;
+            this.preparation = preparation;
+            this.interceptors = interceptors;
+        }
+
+        @Override
+        public Class<T> getType() {
+            return type;
+        }
+
+        @Override
+        public void enable() {
+            if (interceptors.putIfAbsent(
+                            type,
+                            object -> {
+                                int index = count++;
+                                MockMethodInterceptor interceptor =
+                                        new MockMethodInterceptor(
+                                                handler.apply(index), settings.apply(index));
+                                mocks.put(object, interceptor);
+                                try {
+                                    @SuppressWarnings("unchecked")
+                                    T cast = (T) object;
+                                    preparation.prepare(cast, index);
+                                } catch (Throwable t) {
+                                    mocks.remove(object); // TODO: filter stack trace?
+                                    throw new MockitoException(
+                                            "Could not initialize mocked construction", t);
+                                }
+                                all.add(object);
+                            })
+                    != null) {
+                throw new MockitoException(
+                        join(
+                                "For "
+                                        + type.getName()
+                                        + ", static mocking is already registered in the current thread",
+                                "",
+                                "To create a new mock, the existing static mock registration must be deregistered"));
+            }
+        }
+
+        @Override
+        public void disable() {
+            if (interceptors.remove(type) == null) {
+                throw new MockitoException(
+                        join(
+                                "Could not deregister "
+                                        + type.getName()
+                                        + " as a static mock since it is not currently registered",
+                                "",
+                                "To register a static mock, use Mockito.mockStatic("
+                                        + type.getSimpleName()
+                                        + ".class)"));
+            }
+            all.clear();
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public List<T> getMocks() {
+            return (List<T>) all;
         }
     }
 }
